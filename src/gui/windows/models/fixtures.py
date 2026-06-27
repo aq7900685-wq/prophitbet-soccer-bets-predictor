@@ -9,6 +9,7 @@ from PyQt6.QtWidgets import QDialog, QLabel, QComboBox, QDateEdit, QFileDialog, 
 from src.database.model import ModelDatabase
 from src.gui.widgets.comboboxes import CheckableComboBox
 from src.gui.widgets.tables import ExcelTable, StylizedTable
+from src.metrics.value import evaluate_value_bets, decision_columns, format_decision
 from src.network.fixtures.footystats.scraper import FootyStatsScraper
 from src.network.fixtures.utils import match_fixture_teams
 from src.network.leagues.league import League
@@ -153,7 +154,8 @@ class FixturesDialog(QDialog):
             'Prob(X)': empty_row,
             'Prob(2)': empty_row,
             'Prob(U)': empty_row,
-            'Prob(O)': empty_row
+            'Prob(O)': empty_row,
+            'Decision': empty_row
         })
         self._table = ExcelTable(
             parent=self,
@@ -239,8 +241,8 @@ class FixturesDialog(QDialog):
 
         empty_cols = ['']*10
         self._table.modify_columns(
-            columns=['Predicted', 'Prob(1)', 'Prob(X)', 'Prob(2)', 'Prob(U)', 'Prob(O)'],
-            data=[empty_cols, empty_cols, empty_cols, empty_cols, empty_cols, empty_cols]
+            columns=['Predicted', 'Prob(1)', 'Prob(X)', 'Prob(2)', 'Prob(U)', 'Prob(O)', 'Decision'],
+            data=[empty_cols, empty_cols, empty_cols, empty_cols, empty_cols, empty_cols, empty_cols]
         )
 
         # Disable model, filter, buttons.
@@ -255,7 +257,7 @@ class FixturesDialog(QDialog):
 
         if target_type == TargetType.RESULT:
             model_ids = self._result_model_ids
-            self._table.hide_columns(columns=['Prob(1)', 'Prob(X)', 'Prob(2)'], hide=False)
+            self._table.hide_columns(columns=['Prob(1)', 'Prob(X)', 'Prob(2)', 'Decision'], hide=False)
             self._table.hide_columns(columns=['Prob(U)', 'Prob(O)'], hide=True)
 
             empty_cols = ['']*10
@@ -263,7 +265,9 @@ class FixturesDialog(QDialog):
         elif target_type == TargetType.OVER_UNDER:
             model_ids = self._uo_model_ids
             self._table.hide_columns(columns=['Prob(1)', 'Prob(X)', 'Prob(2)'], hide=True)
+            # Over/Under decisions require Over/Under odds, which the fixture only supplies for 1/X/2.
             self._table.hide_columns(columns=['Prob(U)', 'Prob(O)'], hide=False)
+            self._table.hide_columns(columns=['Decision'], hide=True)
         else:
             raise ValueError(f'Undefined targets: "{target_type}"')
 
@@ -334,6 +338,20 @@ class FixturesDialog(QDialog):
         mapped_y_pred = mapper.take(self._y_pred)
         data = np.hstack([np.expand_dims(mapped_y_pred, axis=-1), self._y_prob])
         self._table.modify_columns(columns=columns, data=data, rows=fixture_df.index.tolist())
+
+        # Value/decision ruling (Result only): decide on expected value vs the offered 1/X/2 odds.
+        if target_type == TargetType.RESULT:
+            decisions = evaluate_value_bets(
+                y_prob=self._y_prob,
+                odds=self._odds.to_numpy(dtype=float),
+                labels=['1', 'X', '2']
+            )
+            self._table.modify_columns(
+                columns=['Decision'],
+                data=[[format_decision(d)] for d in decisions],
+                rows=fixture_df.index.tolist()
+            )
+
         self._highlight_matches()
 
         # Enable export button.
@@ -484,6 +502,16 @@ class FixturesDialog(QDialog):
 
         if target_type == TargetType.RESULT:
             df = pd.DataFrame(data=data, columns=['Home Team', 'Away Team', '1', 'X', '2', 'Predicted', 'Prob(1)', 'Prob(X)', 'Prob(2)'])
+
+            # Append the value/decision ruling so the exported table carries the SKIP/BET call.
+            if df.shape[0] > 0:
+                decisions = evaluate_value_bets(
+                    y_prob=df[['Prob(1)', 'Prob(X)', 'Prob(2)']].to_numpy(dtype=float),
+                    odds=df[['1', 'X', '2']].to_numpy(dtype=float),
+                    labels=['1', 'X', '2']
+                )
+                for col, values in decision_columns(decisions).items():
+                    df[col] = values
         else:
             df = pd.DataFrame(data=data, columns=['Home Team', 'Away Team', '1', 'X', '2', 'Predicted', 'Prob(U)', 'Prob(O)'])
 

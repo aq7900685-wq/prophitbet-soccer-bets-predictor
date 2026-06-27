@@ -3,6 +3,7 @@ from datetime import date
 from PyQt6.QtWidgets import QDialog, QLabel, QLineEdit, QComboBox, QHBoxLayout, QMessageBox, QPushButton, QVBoxLayout
 from src.database.model import ModelDatabase
 from src.gui.widgets.tables import SimpleTableDialog
+from src.metrics.value import evaluate_value_bet, format_decision
 from src.preprocessing.utils.target import TargetType
 from src.preprocessing.utils.inputs import construct_inputs_by_teams
 
@@ -211,6 +212,17 @@ class PredictorDialog(QDialog):
             match_df['Prob(1)'] = y_prob[0]
             match_df['Prob(X)'] = y_prob[1]
             match_df['Prob(2)'] = y_prob[2]
+
+            # Value/decision ruling: decide on expected value vs the offered 1/X/2 odds, not on win%.
+            decision = evaluate_value_bet(
+                probs=y_prob,
+                odds=match_df[['1', 'X', '2']].to_numpy(dtype=float)[0],
+                labels=['1', 'X', '2']
+            )
+            match_df['Value'] = f'{decision["pick"]}{"" if decision["consistent"] else "*"}'
+            match_df['EV%'] = round(decision['ev']*100.0, 1)
+            match_df['Edge%'] = round(decision['edge']*100.0, 1)
+            match_df['Decision'] = format_decision(decision)
         elif target_type == TargetType.OVER_UNDER:
             match_df['Predicted'] = self._result_uo_dict[y_pred[0]]
             match_df['Prob(U)'] = y_prob[0]
