@@ -19,8 +19,8 @@ class PredictorDialog(QDialog):
         self._model_db = model_db
         self._model_ids = model_db.get_model_ids()
         self._title = 'Manual Prediction Dialog'
-        self._width = 500
-        self._height = 180
+        self._width = 540
+        self._height = 240
 
         self._home_teams = sorted(df['Home'].unique().tolist())
         self._away_teams = sorted(df['Away'].unique().tolist())
@@ -46,6 +46,9 @@ class PredictorDialog(QDialog):
         self._edit_home_odd = None
         self._edit_draw_odd = None
         self._edit_away_odd = None
+        self._edit_under_odd = None
+        self._edit_over_odd = None
+        self._edit_min_edge = None
         self._predict_btn = None
 
         self._initialize_window()
@@ -122,6 +125,29 @@ class PredictorDialog(QDialog):
         odds_hbox.addWidget(self._edit_away_odd)
         odds_hbox.addStretch(1)
         root.addLayout(odds_hbox)
+
+        # Over/Under odds (used by the value/decision ruling for the U/O-2.5 target only) + min edge.
+        decision_hbox = QHBoxLayout()
+        decision_hbox.addStretch(1)
+        self._edit_under_odd = QLineEdit(text='1.00')
+        self._edit_under_odd.setFixedWidth(60)
+        self._edit_under_odd.setPlaceholderText('Under Odd...')
+        decision_hbox.addWidget(QLabel('U:'))
+        decision_hbox.addWidget(self._edit_under_odd)
+
+        self._edit_over_odd = QLineEdit(text='1.00')
+        self._edit_over_odd.setFixedWidth(60)
+        self._edit_over_odd.setPlaceholderText('Over Odd...')
+        decision_hbox.addWidget(QLabel('O:'))
+        decision_hbox.addWidget(self._edit_over_odd)
+
+        self._edit_min_edge = QLineEdit(text='5')
+        self._edit_min_edge.setFixedWidth(50)
+        self._edit_min_edge.setToolTip('Minimum expected-value edge (%) required to rule BET instead of SHOP/SKIP.')
+        decision_hbox.addWidget(QLabel('  Min Edge %:'))
+        decision_hbox.addWidget(self._edit_min_edge)
+        decision_hbox.addStretch(1)
+        root.addLayout(decision_hbox)
 
         self._predict_btn = QPushButton('Predict')
         self._predict_btn.setFixedWidth(100)
@@ -206,6 +232,7 @@ class PredictorDialog(QDialog):
 
         # Adding predictions to Dataframe.
         target_type = self._target_types[self._combo_target.currentText()]
+        min_edge = float(self._edit_min_edge.text().strip())/100.0
 
         if target_type == TargetType.RESULT:
             match_df['Predicted'] = self._result_dict[y_pred[0]]
@@ -217,27 +244,44 @@ class PredictorDialog(QDialog):
             decision = evaluate_value_bet(
                 probs=y_prob,
                 odds=match_df[['1', 'X', '2']].to_numpy(dtype=float)[0],
-                labels=['1', 'X', '2']
+                labels=['1', 'X', '2'],
+                min_edge=min_edge
             )
-            match_df['Value'] = f'{decision["pick"]}{"" if decision["consistent"] else "*"}'
-            match_df['EV%'] = round(decision['ev']*100.0, 1)
-            match_df['Edge%'] = round(decision['edge']*100.0, 1)
-            match_df['Decision'] = format_decision(decision)
         elif target_type == TargetType.OVER_UNDER:
             match_df['Predicted'] = self._result_uo_dict[y_pred[0]]
             match_df['Prob(U)'] = y_prob[0]
             match_df['Prob(O)'] = y_prob[1]
+
+            # Value/decision ruling using the manually-entered Under/Over odds.
+            decision = evaluate_value_bet(
+                probs=y_prob,
+                odds=[float(self._edit_under_odd.text().strip()), float(self._edit_over_odd.text().strip())],
+                labels=['U', 'O'],
+                min_edge=min_edge
+            )
         else:
             raise ValueError(f'Undefined target type: "{target_type}".')
+
+        match_df['Value'] = f'{decision["pick"]}{"" if decision["consistent"] else "*"}'
+        match_df['EV%'] = round(decision['ev']*100.0, 1)
+        match_df['Edge%'] = round(decision['edge']*100.0, 1)
+        match_df['Decision'] = format_decision(decision)
 
         SimpleTableDialog(df=match_df, parent=self, title='Prediction', readonly=False).show()
 
     def _validate_inputs(self) -> bool:
+        # 1/X/2 odds are always required (they are model input features).
         odds = [
             self._edit_home_odd.text(),
             self._edit_draw_odd.text(),
             self._edit_away_odd.text(),
         ]
+
+        # Under/Over odds are required only for the U/O-2.5 target (used by the decision ruling).
+        target_type = self._target_types.get(self._combo_target.currentText())
+        if target_type == TargetType.OVER_UNDER:
+            odds += [self._edit_under_odd.text(), self._edit_over_odd.text()]
+
         for odd in odds:
             try:
                 odd = float(odd.strip())
@@ -248,4 +292,15 @@ class PredictorDialog(QDialog):
                 if odd <= 1.0:
                     QMessageBox.critical(self, 'Invalid Odds', f'Odds cannot be less than 1.00, found "{odd}".')
                     return False
+
+        # Min edge must be a non-negative percentage.
+        try:
+            min_edge = float(self._edit_min_edge.text().strip())
+        except ValueError:
+            QMessageBox.critical(self, 'Invalid Min Edge', f'Min Edge "{self._edit_min_edge.text()}" is not numeric.')
+            return False
+        else:
+            if min_edge < 0.0:
+                QMessageBox.critical(self, 'Invalid Min Edge', f'Min Edge cannot be negative, found "{min_edge}".')
+                return False
         return True

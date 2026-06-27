@@ -5,11 +5,11 @@ import pandas as pd
 from datetime import date, timedelta
 from typing import Optional
 from PyQt6.QtCore import QDate, QTimer
-from PyQt6.QtWidgets import QDialog, QLabel, QComboBox, QDateEdit, QFileDialog, QHBoxLayout, QMessageBox, QPushButton, QVBoxLayout
+from PyQt6.QtWidgets import QDialog, QLabel, QLineEdit, QComboBox, QDateEdit, QFileDialog, QHBoxLayout, QMessageBox, QPushButton, QVBoxLayout
 from src.database.model import ModelDatabase
 from src.gui.widgets.comboboxes import CheckableComboBox
 from src.gui.widgets.tables import ExcelTable, StylizedTable
-from src.metrics.value import evaluate_value_bets, decision_columns, format_decision
+from src.metrics.value import evaluate_value_bet, evaluate_value_bets, decision_columns, format_decision
 from src.network.fixtures.footystats.scraper import FootyStatsScraper
 from src.network.fixtures.utils import match_fixture_teams
 from src.network.leagues.league import League
@@ -57,6 +57,7 @@ class FixturesDialog(QDialog):
         self._combo_model = None
         self._combo_target = None
         self._export_btn = None
+        self._edit_min_edge = None
         self._combo_filters = None
         self._table = None
 
@@ -133,6 +134,12 @@ class FixturesDialog(QDialog):
 
         export_hbox = QHBoxLayout()
         export_hbox.addStretch(1)
+        self._edit_min_edge = QLineEdit(text='5')
+        self._edit_min_edge.setFixedWidth(50)
+        self._edit_min_edge.setToolTip('Minimum expected-value edge (%) required to rule BET instead of SHOP/SKIP.')
+        export_hbox.addWidget(QLabel('Min Edge %:'))
+        export_hbox.addWidget(self._edit_min_edge)
+        export_hbox.addSpacing(20)
         self._export_btn = QPushButton('Export')
         self._export_btn.setFixedWidth(100)
         self._export_btn.setFixedHeight(30)
@@ -155,7 +162,9 @@ class FixturesDialog(QDialog):
             'Prob(2)': empty_row,
             'Prob(U)': empty_row,
             'Prob(O)': empty_row,
-            'Decision': empty_row
+            'Decision': empty_row,
+            'U': empty_row,
+            'O': empty_row
         })
         self._table = ExcelTable(
             parent=self,
@@ -168,7 +177,9 @@ class FixturesDialog(QDialog):
         self._table = StylizedTable().stylize_table(table=self._table, options_dict={0: self._home_teams, 1: self._away_teams})
         self._table.setColumnWidth(0, 150)
         self._table.setColumnWidth(1, 150)
-        self._table.hide_columns(columns=['Prob(1)', 'Prob(X)', 'Prob(2)', 'Prob(U)', 'Prob(O)'], hide=True)
+        self._table.hide_columns(columns=['Prob(1)', 'Prob(X)', 'Prob(2)', 'Prob(U)', 'Prob(O)', 'U', 'O'], hide=True)
+        # Recompute the Over/Under decision live as the user types Over/Under odds.
+        self._table.cellChanged.connect(self._on_cell_changed)
         root.addWidget(self._table)
 
     def _on_date_change(self, qdate: QDate):
@@ -258,16 +269,15 @@ class FixturesDialog(QDialog):
         if target_type == TargetType.RESULT:
             model_ids = self._result_model_ids
             self._table.hide_columns(columns=['Prob(1)', 'Prob(X)', 'Prob(2)', 'Decision'], hide=False)
-            self._table.hide_columns(columns=['Prob(U)', 'Prob(O)'], hide=True)
+            self._table.hide_columns(columns=['Prob(U)', 'Prob(O)', 'U', 'O'], hide=True)
 
             empty_cols = ['']*10
             self._table.modify_columns(columns=['Predicted', 'Prob(U)', 'Prob(O)'], data=[empty_cols, empty_cols, empty_cols])
         elif target_type == TargetType.OVER_UNDER:
             model_ids = self._uo_model_ids
             self._table.hide_columns(columns=['Prob(1)', 'Prob(X)', 'Prob(2)'], hide=True)
-            # Over/Under decisions require Over/Under odds, which the fixture only supplies for 1/X/2.
-            self._table.hide_columns(columns=['Prob(U)', 'Prob(O)'], hide=False)
-            self._table.hide_columns(columns=['Decision'], hide=True)
+            # Over/Under decisions require manually-entered Over/Under odds (U, O columns).
+            self._table.hide_columns(columns=['Prob(U)', 'Prob(O)', 'Decision', 'U', 'O'], hide=False)
         else:
             raise ValueError(f'Undefined targets: "{target_type}"')
 
@@ -339,18 +349,24 @@ class FixturesDialog(QDialog):
         data = np.hstack([np.expand_dims(mapped_y_pred, axis=-1), self._y_prob])
         self._table.modify_columns(columns=columns, data=data, rows=fixture_df.index.tolist())
 
-        # Value/decision ruling (Result only): decide on expected value vs the offered 1/X/2 odds.
+        # Value/decision ruling.
         if target_type == TargetType.RESULT:
+            # Result: decide on expected value vs the offered 1/X/2 odds.
             decisions = evaluate_value_bets(
                 y_prob=self._y_prob,
                 odds=self._odds.to_numpy(dtype=float),
-                labels=['1', 'X', '2']
+                labels=['1', 'X', '2'],
+                min_edge=self._read_min_edge()
             )
             self._table.modify_columns(
                 columns=['Decision'],
                 data=[[format_decision(d)] for d in decisions],
                 rows=fixture_df.index.tolist()
             )
+        else:
+            # Over/Under: decisions depend on the manually-entered U/O odds; compute any already filled.
+            for row in fixture_df.index.tolist():
+                self._recompute_ou_decision(row=row)
 
         self._highlight_matches()
 
@@ -359,6 +375,56 @@ class FixturesDialog(QDialog):
 
     def _on_filters_change(self):
         self._highlight_matches()
+
+    def _read_min_edge(self) -> float:
+        """ Reads the minimum-edge threshold (as a fraction). Falls back to the default on bad input. """
+
+        try:
+            return max(0.0, float(self._edit_min_edge.text().strip())/100.0)
+        except (ValueError, AttributeError):
+            return 0.05
+
+    def _on_cell_changed(self, row: int, col: int):
+        """ Recomputes the Over/Under decision when the user edits an Over/Under odd cell. """
+
+        if col in (self._table.columns.index('U'), self._table.columns.index('O')):
+            self._recompute_ou_decision(row=row)
+
+    def _recompute_ou_decision(self, row: int):
+        """ Recomputes a single row's Over/Under decision from its predicted probabilities and the
+            manually-entered U/O odds. Leaves the Decision blank when odds are missing/invalid.
+        """
+
+        target_type = self._target_types.get(self._combo_target.currentText())
+        if target_type != TargetType.OVER_UNDER or self._y_prob is None or self._index is None:
+            return
+
+        # Map the table row back to the prediction row.
+        positions = np.where(self._index == row)[0]
+        if positions.size == 0:
+            return
+        pos = int(positions[0])
+
+        u_item = self._table.item(row, self._table.columns.index('U'))
+        o_item = self._table.item(row, self._table.columns.index('O'))
+        try:
+            under_odd = float(u_item.text().strip())
+            over_odd = float(o_item.text().strip())
+        except (AttributeError, ValueError):
+            self._table.modify_columns(columns=['Decision'], data=[['']], rows=[row])
+            return
+
+        if under_odd <= 1.0 or over_odd <= 1.0:
+            self._table.modify_columns(columns=['Decision'], data=[['']], rows=[row])
+            return
+
+        decision = evaluate_value_bet(
+            probs=self._y_prob[pos],
+            odds=np.array([under_odd, over_odd]),
+            labels=['U', 'O'],
+            min_edge=self._read_min_edge()
+        )
+        self._table.modify_columns(columns=['Decision'], data=[[format_decision(decision)]], rows=[row])
 
     def _read_fixture(self) -> Optional[pd.DataFrame]:
         """ Reads the fixture and validates the values. """
@@ -474,28 +540,34 @@ class FixturesDialog(QDialog):
         # Export the selected items.
         data = []
         target_type = self._target_types[self._combo_target.currentText()]
+
+        def cell_text(r: int, name: str) -> str:
+            item = self._table.item(r, self._table.columns.index(name))
+            return item.text().strip() if item else ''
+
         for row in range(10):
             if row in highlight_ids:
-                home_item = self._table.item(row, 0)
-                home = home_item.text().strip() if home_item else ""
-                away_item = self._table.item(row, 1)
-                away = away_item.text().strip() if away_item else ""
-                odd_1 = self._table.item(row, 2).text().strip()
-                odd_x = self._table.item(row, 3).text().strip()
-                odd_2 = self._table.item(row, 4).text().strip()
-                predicted = self._table.item(row, 5).text().strip()
+                home = cell_text(row, 'Home')
+                away = cell_text(row, 'Away')
+                odd_1 = cell_text(row, '1')
+                odd_x = cell_text(row, 'X')
+                odd_2 = cell_text(row, '2')
+                predicted = cell_text(row, 'Predicted')
                 data_row = [home, away, odd_1, odd_x, odd_2, predicted]
 
                 if target_type == TargetType.RESULT:
                     data_row.extend([
-                        float(self._table.item(row, 6).text().strip()),
-                        float(self._table.item(row, 7).text().strip()),
-                        float(self._table.item(row, 8).text().strip())
+                        float(cell_text(row, 'Prob(1)')),
+                        float(cell_text(row, 'Prob(X)')),
+                        float(cell_text(row, 'Prob(2)'))
                     ])
                 else:
+                    # Probabilities + the manually-entered Over/Under odds (kept as text; may be blank).
                     data_row.extend([
-                        float(self._table.item(row, 6).text().strip()),
-                        float(self._table.item(row, 7).text().strip())
+                        float(cell_text(row, 'Prob(U)')),
+                        float(cell_text(row, 'Prob(O)')),
+                        cell_text(row, 'U'),
+                        cell_text(row, 'O')
                     ])
 
                 data.append(data_row)
@@ -508,12 +580,42 @@ class FixturesDialog(QDialog):
                 decisions = evaluate_value_bets(
                     y_prob=df[['Prob(1)', 'Prob(X)', 'Prob(2)']].to_numpy(dtype=float),
                     odds=df[['1', 'X', '2']].to_numpy(dtype=float),
-                    labels=['1', 'X', '2']
+                    labels=['1', 'X', '2'],
+                    min_edge=self._read_min_edge()
                 )
                 for col, values in decision_columns(decisions).items():
                     df[col] = values
         else:
-            df = pd.DataFrame(data=data, columns=['Home Team', 'Away Team', '1', 'X', '2', 'Predicted', 'Prob(U)', 'Prob(O)'])
+            df = pd.DataFrame(data=data, columns=['Home Team', 'Away Team', '1', 'X', '2', 'Predicted', 'Prob(U)', 'Prob(O)', 'U', 'O'])
+
+            # Append the value/decision ruling per row (blank when Over/Under odds are missing/invalid).
+            if df.shape[0] > 0:
+                value, ev_pct, edge_pct, ruling = [], [], [], []
+                probs = df[['Prob(U)', 'Prob(O)']].to_numpy(dtype=float)
+                for i in range(df.shape[0]):
+                    try:
+                        under_odd, over_odd = float(df.iloc[i]['U']), float(df.iloc[i]['O'])
+                        valid = under_odd > 1.0 and over_odd > 1.0
+                    except ValueError:
+                        valid = False
+
+                    if valid:
+                        d = evaluate_value_bet(
+                            probs=probs[i],
+                            odds=np.array([under_odd, over_odd]),
+                            labels=['U', 'O'],
+                            min_edge=self._read_min_edge()
+                        )
+                        value.append(f'{d["pick"]}{"" if d["consistent"] else "*"}')
+                        ev_pct.append(round(d['ev']*100.0, 1))
+                        edge_pct.append(round(d['edge']*100.0, 1))
+                        ruling.append(d['decision'])
+                    else:
+                        value.append('')
+                        ev_pct.append('')
+                        edge_pct.append('')
+                        ruling.append('')
+                df['Value'], df['EV%'], df['Edge%'], df['Decision'] = value, ev_pct, edge_pct, ruling
 
         default_filepath = f'{self._league.league_id}-fixures.csv'
         path, _ = QFileDialog.getSaveFileName(self, 'Export to CSV', default_filepath, 'CSV Files (*.csv)')
